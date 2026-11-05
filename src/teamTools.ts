@@ -105,12 +105,17 @@ async function checkSpawnLimits(
   return null
 }
 
-function currentTeamName(): string | undefined {
-  return process.env.PI_TEAM_NAME
+/**
+ * 解析当前会话身份。优先用扩展加载时捕获的值（宿主在成员会话创建期注入的
+ * PI_AGENT_NAME/PI_TEAM_NAME），缺省回落到进程环境变量——oh-my-pi 独立进程模型下
+ * 环境变量由 spawn 时设置并全程存在，捕获与回落结果一致。
+ */
+export function resolveAgentName(captured: string | undefined): string | undefined {
+  return captured ?? process.env.PI_AGENT_NAME
 }
 
-function currentAgentName(): string | undefined {
-  return process.env.PI_AGENT_NAME
+export function resolveTeamContext(captured: string | undefined): string | undefined {
+  return captured ?? process.env.PI_TEAM_NAME
 }
 
 export interface TeamEnv {
@@ -130,9 +135,18 @@ export interface TeamRuntime {
   handleFinish(teamName: string, handle: MemberRunHandle, notify: string[]): Promise<void>
   /** 订阅宿主完成事件；返回退订。 */
   subscribeHostFinish(teamName: string): () => void
+  /** 当前会话身份（扩展加载时捕获；缺省回落进程环境变量）。 */
+  readonly agentName: string | undefined
+  /** 当前会话团队上下文（扩展加载时捕获；缺省回落进程环境变量）。 */
+  readonly teamName: string | undefined
 }
 
-export function createTeamRuntime(host: TeamHost): TeamRuntime {
+export function createTeamRuntime(
+  host: TeamHost,
+  identity?: { agentName?: string; teamName?: string },
+): TeamRuntime {
+  const capturedAgentName = identity?.agentName ?? process.env.PI_AGENT_NAME
+  const capturedTeamName = identity?.teamName ?? process.env.PI_TEAM_NAME
   const envCache = new Map<string, TeamEnv>()
   const envFor = (teamName: string): TeamEnv => {
     const cached = envCache.get(teamName)
@@ -140,7 +154,7 @@ export function createTeamRuntime(host: TeamHost): TeamRuntime {
     const lifecycle = getLifecycle(teamName, host)
     const env: TeamEnv = {
       teamName,
-      self: currentAgentName() || TEAM_LEAD_NAME,
+      self: resolveAgentName(capturedAgentName) || TEAM_LEAD_NAME,
       host,
       lifecycle,
       bus: null as unknown as TeamBus,
@@ -158,7 +172,7 @@ export function createTeamRuntime(host: TeamHost): TeamRuntime {
         markIdle: (name) => lifecycle.markIdle(name),
       }),
       teamName: () => teamName,
-      self: () => currentAgentName() || TEAM_LEAD_NAME,
+      self: () => resolveAgentName(capturedAgentName) || TEAM_LEAD_NAME,
       members: env.memberNames,
     })
     envCache.set(teamName, env)
@@ -167,6 +181,8 @@ export function createTeamRuntime(host: TeamHost): TeamRuntime {
   return {
     host,
     envFor,
+    agentName: capturedAgentName,
+    teamName: capturedTeamName,
     async handleFinish(teamName, handle, notify) {
       const env = envFor(teamName)
       // 把宿主会话 ID 映射回成员名：未答复记录按成员名记，必须用名字回reply。
@@ -194,14 +210,30 @@ export function createTeamRuntime(host: TeamHost): TeamRuntime {
     },
     subscribeHostFinish(teamName) {
       return host.onFinish((handle) => {
-        void this.handleFinish(teamName, handle, [currentAgentName() || TEAM_LEAD_NAME])
+        void this.handleFinish(teamName, handle, [resolveAgentName(capturedAgentName) || TEAM_LEAD_NAME])
       })
     },
   }
 }
 
+/**
+ * 团队级操作仅限 team-lead（设计文档 §8.4：worker 不能再 spawn worker）。
+ * 当前会话身份存在且不是 team-lead（即成员会话）时返回拒绝消息；身份缺省时放行，
+ * 保持宿主未注入身份时的既有行为（graceful degradation）。
+ */
+function requireTeamLead(runtime: TeamRuntime): string | null {
+  const name = resolveAgentName(runtime.agentName)
+  if (name && name !== TEAM_LEAD_NAME) {
+    return (
+      `团队级操作仅限 team-lead：当前身份是 "${name}"。` +
+      `需要更多人力请用 team_message 请求 lead。`
+    )
+  }
+  return null
+}
+
 async function requireTeam(env: TeamEnv, teamName: string | undefined): Promise<string> {
-  const name = teamName || currentTeamName()
+  const name = teamName || resolveTeamContext(env.teamName)
   if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文（PI_TEAM_NAME）。')
   const team = await readTeamFileAsync(name)
   if (!team) throw new Error(`团队 "${name}" 不存在。`)
@@ -209,9 +241,9 @@ async function requireTeam(env: TeamEnv, teamName: string | undefined): Promise<
   return name
 }
 
-/** 解析要操作的团队名：显式参数 > PI_TEAM_NAME 上下文；并校验其存在。 */
-async function resolveTeamName(teamName: string | undefined): Promise<string> {
-  const name = teamName || currentTeamName()
+/** 解析要操作的团队名：显式参数 > 本会话捕获的团队上下文 > PI_TEAM_NAME；并校验其存在。 */
+async function resolveTeamName(teamName: string | undefined, captured?: string | undefined): Promise<string> {
+  const name = teamName || resolveTeamContext(captured)
   if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文（PI_TEAM_NAME）。')
   const team = await readTeamFileAsync(name)
   if (!team) throw new Error(`团队 "${name}" 不存在。`)
@@ -268,6 +300,8 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
       ),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
+      const denial = requireTeamLead(runtime)
+      if (denial) return toolErrorResult(denial)
       const now = Date.now()
       const name = params.team_name
       try {
@@ -320,6 +354,10 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
                 profile: member.agent_type || 'general-purpose',
                 task: member.prompt,
                 description: `${name}/${member.name}`,
+                // 成员身份注入：宿主据此在成员会话写入 PI_AGENT_NAME / PI_TEAM_NAME，
+                // 并把成员身份写进 system prompt（设计文档 §8.4）。
+                teamName: name,
+                agentName: member.name,
                 ...(member.model ? { model: member.model } : {}),
                 runInBackground: true,
               },
@@ -377,8 +415,10 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
       ),
     }),
     async execute(_id, params) {
+      const denial = requireTeamLead(runtime)
+      if (denial) return toolErrorResult(denial)
       try {
-        const teamName = await resolveTeamName(params.team_name)
+        const teamName = await resolveTeamName(params.team_name, runtime.teamName)
         const sessionId = process.env.PI_SESSION_ID || 'unknown-session'
 
         if (params.operation === 'get') {
@@ -452,8 +492,10 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
       team_name: Type.Optional(Type.String({ description: '团队名；缺省用当前团队上下文' })),
     }),
     async execute(_id, params) {
+      const denial = requireTeamLead(runtime)
+      if (denial) return toolErrorResult(denial)
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const team = await readTeamFileAsync(name)
         if (!team) return toolErrorResult(`团队 "${name}" 不存在。`)
@@ -483,11 +525,11 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const team = await readTeamFileAsync(name)
         if (!team) return toolErrorResult(`团队 "${name}" 不存在。`)
-        const from = currentAgentName() || TEAM_LEAD_NAME
+        const from = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME
         const env = runtime.envFor(name)
 
         if (params.recipient !== '*') {
@@ -518,10 +560,10 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         const names = name ? [name] : await listTeamNames()
         if (names.length === 0) return toolTextResult('暂无团队。用 team_create 创建一个。')
-        const self = currentAgentName() || TEAM_LEAD_NAME
+        const self = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME
         const lines: string[] = []
         for (const teamName of names) {
           const team = await readTeamFileAsync(teamName)
@@ -568,12 +610,12 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params, signal) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const team = await readTeamFileAsync(name)
         if (!team) return toolErrorResult(`团队 "${name}" 不存在。`)
         const env = runtime.envFor(name)
-        const self = currentAgentName() || TEAM_LEAD_NAME
+        const self = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME
         const timeout = params.timeout_ms === undefined ? 120_000 : params.timeout_ms
 
         let filter: { from?: string; directOnly?: boolean; repliesFrom?: string[] }
@@ -608,7 +650,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const env = runtime.envFor(name)
         const team = await readTeamFileAsync(name)
@@ -645,13 +687,13 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const env = runtime.envFor(name)
         const entry = await env.lifecycle.get(params.member)
         const sessionId = entry?.sessionId ?? params.member
         const handle = await host.get(sessionId, ctx as CompatToolContext)
-        const self = currentAgentName() || TEAM_LEAD_NAME
+        const self = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME
         // 记为该成员对我（当前 agent）的回复，之后不再重复唤醒。
         env.bus.recordReply(params.member, self)
         await appendAccepted(name, {
@@ -682,7 +724,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     }),
     async execute(_id, params) {
       try {
-        const name = params.team_name || currentTeamName()
+        const name = params.team_name || resolveTeamContext(runtime.teamName)
         if (!name) throw new Error('未指定团队名，且当前会话没有团队上下文。')
         const env = runtime.envFor(name)
         const entry = await env.lifecycle.get(params.member)

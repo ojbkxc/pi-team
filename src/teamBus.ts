@@ -15,7 +15,12 @@ import {
   claimMailboxMessages,
   formatTeammateMessages,
 } from './teammateMailbox.js'
-import { getDispatchQuietWindowMs, getDispatchMaxWaitMs } from './constants.js'
+import {
+  getDispatchQuietWindowMs,
+  getDispatchMaxWaitMs,
+  isHumanPriorityEnabled,
+  HUMAN_SENDER_NAME,
+} from './constants.js'
 import type { MemberRunHandle, TeamHost } from './teamHost.js'
 import type { MemberLifecycleStatus } from './teamLifecycle.js'
 
@@ -229,7 +234,10 @@ export class TeamBus {
       if (!revived) error = `成员 ${options.to} 处于 ${entry.status} 且复活失败；消息已落盘。`
     } else if (entry.sessionId) {
       outcome = 'woken'
-      this.#scheduleWake(options.to, entry.sessionId)
+      // 人类优先槽（§8.4）：人的直发消息跳过静默合并窗口，立刻派发，
+      // 避免被成员之间的一串消息按防抖窗口往后推而饿死。
+      if (this.#isHumanPriority(options)) void this.#flush(options.to, entry.sessionId)
+      else this.#scheduleWake(options.to, entry.sessionId)
     } else {
       outcome = 'buffered'
       error = `成员 ${options.to} 无活跃会话 ID；消息已落盘，待其恢复后 drain。`
@@ -357,6 +365,14 @@ export class TeamBus {
   // -------------------------------------------------------------------------
   // 合并派发：静默窗口内到达的消息合成一次 wake
   // -------------------------------------------------------------------------
+
+  /**
+   * 人类优先槽（§8.4）：人的直发消息不进静默合并窗口，立刻派发。
+   * 进度型消息（progress）不算，它本来就是低频播报。
+   */
+  #isHumanPriority(options: BusSendOptions): boolean {
+    return isHumanPriorityEnabled() && options.from === HUMAN_SENDER_NAME && !options.progress
+  }
 
   #scheduleWake(to: string, sessionId: string): void {
     const quiet = getDispatchQuietWindowMs()

@@ -37,6 +37,17 @@ export interface MemberSpawnRequest {
   task: string
   /** 界面上的短标签。 */
   description: string
+  /**
+   * 团队名：成员身份注入的上下文（宿主据此在成员会话写入 PI_TEAM_NAME，
+   * 供邮箱投递与生命周期使用）。
+   */
+  teamName?: string
+  /**
+   * 成员名（PI_AGENT_NAME）：宿主据此在成员会话注入身份。
+   * 设计文档 §8.4：worker 不能再 spawn worker——成员会话据此身份被拦截
+   * 团队级操作（team_create / team_plan / team_delete），只能请求 lead。
+   */
+  agentName?: string
   /** 可选 provider/modelId 覆盖。 */
   model?: string
   /** 可选思考级别。 */

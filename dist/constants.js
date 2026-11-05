@@ -91,6 +91,21 @@ export function getMaxGlobalWorkers() {
     return positiveIntFromEnv('PI_TEAM_MAX_GLOBAL_WORKERS', DEFAULT_MAX_GLOBAL_WORKERS);
 }
 export const TEAM_LIMIT_PREFIX = 'LIMIT_EXCEEDED';
+/**
+ * 人类优先槽（设计文档 §8.4）。
+ *
+ * 借鉴 DeepSeek 的有界并发槽位：给「人」留一个额外槽位，人的消息/状态请求不排队，
+ * 直接插队。落地方式是不进静默合并窗口 —— 成员之间的消息走 `DISPATCH_QUIET_WINDOW_MS`
+ * 的防抖合并（减少唤醒次数），而人的直发消息立即派发，避免被一串 agent 消息饿死。
+ *
+ * 默认开启；`PI_TEAM_HUMAN_PRIORITY=0` 可关闭（例如测试里想观察纯合并行为时）。
+ */
+export function isHumanPriorityEnabled() {
+    const raw = process.env.PI_TEAM_HUMAN_PRIORITY;
+    return raw !== '0' && raw !== 'false';
+}
+/** 人类发言者的身份名。与成员名同处一个命名空间，用保留名避免撞名。 */
+export const HUMAN_SENDER_NAME = 'human';
 /** 成员空闲多久后进入 parked（挂起）。<= 0 关闭自动挂起。默认 2 分钟。 */
 export const DEFAULT_IDLE_TTL_MS = 120_000;
 /**

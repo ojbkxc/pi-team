@@ -10,7 +10,7 @@
  * 本类只额外管理进程内的等待者、发送标记与合并派发。
  */
 import { readUnreadMessages, writeToMailbox, claimMailboxMessages, formatTeammateMessages, } from './teammateMailbox.js';
-import { getDispatchQuietWindowMs, getDispatchMaxWaitMs } from './constants.js';
+import { getDispatchQuietWindowMs, getDispatchMaxWaitMs, isHumanPriorityEnabled, HUMAN_SENDER_NAME, } from './constants.js';
 export function busWaitAccepts(filter, message) {
     if (filter.from !== undefined && message.from !== filter.from)
         return false;
@@ -153,7 +153,12 @@ export class TeamBus {
         }
         else if (entry.sessionId) {
             outcome = 'woken';
-            this.#scheduleWake(options.to, entry.sessionId);
+            // 人类优先槽（§8.4）：人的直发消息跳过静默合并窗口，立刻派发，
+            // 避免被成员之间的一串消息按防抖窗口往后推而饿死。
+            if (this.#isHumanPriority(options))
+                void this.#flush(options.to, entry.sessionId);
+            else
+                this.#scheduleWake(options.to, entry.sessionId);
         }
         else {
             outcome = 'buffered';
@@ -282,6 +287,13 @@ export class TeamBus {
     // -------------------------------------------------------------------------
     // 合并派发：静默窗口内到达的消息合成一次 wake
     // -------------------------------------------------------------------------
+    /**
+     * 人类优先槽（§8.4）：人的直发消息不进静默合并窗口，立刻派发。
+     * 进度型消息（progress）不算，它本来就是低频播报。
+     */
+    #isHumanPriority(options) {
+        return isHumanPriorityEnabled() && options.from === HUMAN_SENDER_NAME && !options.progress;
+    }
     #scheduleWake(to, sessionId) {
         const quiet = getDispatchQuietWindowMs();
         const maxWait = getDispatchMaxWaitMs();

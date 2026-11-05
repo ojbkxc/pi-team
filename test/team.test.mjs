@@ -368,3 +368,97 @@ test('超出全局上限时拒绝派发，拒绝消息区分 global', async () =
     delete process.env.PI_TEAM_MAX_GLOBAL_WORKERS
   }
 })
+
+// --- 人类优先槽（设计文档 §8.4）---------------------------------------------
+
+test('人的直发消息跳过静默合并窗口，立刻唤醒；成员消息仍合并', async () => {
+  // 把静默窗口调大，如果人类消息也走合并，它在窗口内不会被唤醒。
+  process.env.PI_TEAM_DISPATCH_QUIET_MS = '5000'
+  process.env.PI_TEAM_DISPATCH_MAX_MS = '6000'
+  try {
+    await callTool(mock.tools, 'team_create', { team_name: 'priority', members: [{ name: 'p', prompt: 'x' }] })
+    const { getLifecycle } = await import('../dist/teamLifecycle.js')
+    const lifecycle = getLifecycle('priority', memory.host)
+    const before = memory.woken.length
+
+    // 以 human 身份直发：应立即 flush（不等 5s 窗口）。
+    const { getBus } = await import('../dist/teamBus.js')
+    const bus = getBus('priority', memory.host)
+    await bus.send({ from: 'human', to: 'p', body: '人类插队消息' })
+    await new Promise((resolve) => setTimeout(resolve, 120))
+
+    const after = memory.woken.length
+    assert.ok(after > before, '人类的直发消息应立即唤醒成员，而不是等 5s 静默窗口')
+    assert.match(memory.woken[after - 1].text, /人类插队消息/)
+    void lifecycle
+  } finally {
+    delete process.env.PI_TEAM_DISPATCH_QUIET_MS
+    delete process.env.PI_TEAM_DISPATCH_MAX_MS
+  }
+})
+
+// --- 成员身份拦截（设计文档 §8.4：worker 不能再 spawn worker）----------------
+
+test('worker 身份下 team_create 被拒，消息含「仅限 team-lead」', async () => {
+  process.env.PI_AGENT_NAME = 'worker-1'
+  try {
+    const result = await callTool(mock.tools, 'team_create', {
+      team_name: 'lead-only',
+      members: [{ name: 'x', prompt: 'x' }],
+    })
+    const text = textOf(result)
+    assert.match(text, /仅限 team-lead/)
+    assert.match(text, /worker-1/)
+    assert.match(text, /team_message/)
+    // 拒绝后不得落盘团队
+    const { listTeamNames } = await import('../dist/teamHelpers.js')
+    assert.ok(!(await listTeamNames()).includes('lead-only'))
+  } finally {
+    delete process.env.PI_AGENT_NAME
+  }
+})
+
+test('worker 身份下 team_message 仍可用', async () => {
+  // 先以 team-lead（无身份）建团队
+  await callTool(mock.tools, 'team_create', { team_name: 'msg-team', members: [{ name: 'w', prompt: 'x' }] })
+  // 再以 worker 身份发消息：team_message 不属于团队级操作，必须可用
+  process.env.PI_AGENT_NAME = 'worker-1'
+  try {
+    const receipt = await callTool(mock.tools, 'team_message', {
+      team_name: 'msg-team',
+      recipient: 'w',
+      message: '继续',
+    })
+    assert.match(textOf(receipt), /w/)
+    assert.match(textOf(receipt), /唤醒|已投递|已入队|复活|落盘/)
+  } finally {
+    delete process.env.PI_AGENT_NAME
+  }
+})
+
+test('未设身份或身份为 team-lead 时 team_create 正常', async () => {
+  // 未设身份：按 team-lead 放行（graceful degradation）
+  const lead1 = await callTool(mock.tools, 'team_create', { team_name: 'no-identity', members: [{ name: 'a', prompt: 'x' }] })
+  assert.match(textOf(lead1), /已创建/)
+  // 身份为 team-lead：放行
+  process.env.PI_AGENT_NAME = 'team-lead'
+  try {
+    const lead2 = await callTool(mock.tools, 'team_create', { team_name: 'lead-identity', members: [{ name: 'b', prompt: 'x' }] })
+    assert.match(textOf(lead2), /已创建/)
+  } finally {
+    delete process.env.PI_AGENT_NAME
+  }
+})
+
+test('扩展加载时捕获的成员身份在环境变量恢复后仍生效', async () => {
+  // 宿主在成员会话创建期注入身份（PI_AGENT_NAME），扩展工厂期捕获；
+  // 之后宿主恢复环境变量，成员会话的团队级操作仍应被拦截。
+  process.env.PI_AGENT_NAME = 'worker-2'
+  piTeamExtension(mock.pi)
+  delete process.env.PI_AGENT_NAME
+  const result = await callTool(mock.tools, 'team_create', {
+    team_name: 'captured',
+    members: [{ name: 'x', prompt: 'x' }],
+  })
+  assert.match(textOf(result), /仅限 team-lead/)
+})

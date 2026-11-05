@@ -15,6 +15,13 @@ import { type TeamFile } from './teamHelpers.js';
 import { type TeamLifecycle } from './teamLifecycle.js';
 import { type TeamBus } from './teamBus.js';
 import type { MemberRunHandle, TeamHost } from './teamHost.js';
+/**
+ * 解析当前会话身份。优先用扩展加载时捕获的值（宿主在成员会话创建期注入的
+ * PI_AGENT_NAME/PI_TEAM_NAME），缺省回落到进程环境变量——oh-my-pi 独立进程模型下
+ * 环境变量由 spawn 时设置并全程存在，捕获与回落结果一致。
+ */
+export declare function resolveAgentName(captured: string | undefined): string | undefined;
+export declare function resolveTeamContext(captured: string | undefined): string | undefined;
 export interface TeamEnv {
     teamName: string;
     self: string;
@@ -31,6 +38,13 @@ export interface TeamRuntime {
     handleFinish(teamName: string, handle: MemberRunHandle, notify: string[]): Promise<void>;
     /** 订阅宿主完成事件；返回退订。 */
     subscribeHostFinish(teamName: string): () => void;
+    /** 当前会话身份（扩展加载时捕获；缺省回落进程环境变量）。 */
+    readonly agentName: string | undefined;
+    /** 当前会话团队上下文（扩展加载时捕获；缺省回落进程环境变量）。 */
+    readonly teamName: string | undefined;
 }
-export declare function createTeamRuntime(host: TeamHost): TeamRuntime;
+export declare function createTeamRuntime(host: TeamHost, identity?: {
+    agentName?: string;
+    teamName?: string;
+}): TeamRuntime;
 export declare function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void;

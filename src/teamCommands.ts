@@ -17,15 +17,7 @@ import {
   formatTeammateMessages,
   readUnreadMessages,
 } from './teammateMailbox.js'
-import type { TeamRuntime } from './teamTools.js'
-
-function currentTeamName(): string | undefined {
-  return process.env.PI_TEAM_NAME
-}
-
-function currentAgentName(): string | undefined {
-  return process.env.PI_AGENT_NAME
-}
+import { resolveAgentName, resolveTeamContext, type TeamRuntime } from './teamTools.js'
 
 /** 同步列出团队名（供参数补全；补全端点只同步取用）。 */
 function listTeamNamesSync(): string[] {
@@ -45,14 +37,14 @@ function teamNameCompletions(prefix: string): CompatAutocompleteItem[] | null {
   return items.length > 0 ? items : null
 }
 
-export function registerTeamCommands(compat: CompatApi, _runtime: TeamRuntime): void {
+export function registerTeamCommands(compat: CompatApi, runtime: TeamRuntime): void {
   // --- /team -------------------------------------------------------------
   compat.registerCommand('team', {
     description: '查看团队状态：成员（含生命周期）、计划、任务、欠我回复的成员',
     getArgumentCompletions: teamNameCompletions,
     async handler(args, ctx) {
       const requested = args.trim()
-      const teamName = requested || currentTeamName()
+      const teamName = requested || resolveTeamContext(runtime.teamName)
       const names = teamName ? [teamName] : listTeamNamesSync()
       if (names.length === 0) {
         ctx.notify?.('暂无团队。用 team_create 工具创建一个。', 'info')
@@ -102,7 +94,7 @@ export function registerTeamCommands(compat: CompatApi, _runtime: TeamRuntime): 
     description: '查看当前团队计划（状态、版本、成员、任务）',
     getArgumentCompletions: teamNameCompletions,
     async handler(args, ctx) {
-      const teamName = args.trim() || currentTeamName()
+      const teamName = args.trim() || resolveTeamContext(runtime.teamName)
       if (!teamName) {
         ctx.notify?.('当前会话没有团队上下文；可传入团队名：/team-plan <团队名>。', 'warning')
         return
@@ -131,7 +123,7 @@ export function registerTeamCommands(compat: CompatApi, _runtime: TeamRuntime): 
     description: '检查当前成员的邮箱未读消息并投递进对话',
     getArgumentCompletions: teamNameCompletions,
     async handler(args, ctx) {
-      const teamName = args.trim() || currentTeamName()
+      const teamName = args.trim() || resolveTeamContext(runtime.teamName)
       if (!teamName) {
         ctx.notify?.('当前会话没有团队上下文；可传入团队名：/team-status <团队名>。', 'warning')
         return
@@ -141,7 +133,7 @@ export function registerTeamCommands(compat: CompatApi, _runtime: TeamRuntime): 
         ctx.notify?.(`团队 "${teamName}" 不存在。`, 'error')
         return
       }
-      const me = currentAgentName() || TEAM_LEAD_NAME
+      const me = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME
       const unread = await readUnreadMessages(me, teamName)
       if (unread.length === 0) {
         ctx.notify?.('没有未读消息。', 'info')

@@ -16,7 +16,8 @@ export default function piTeamExtension(pi, host) {
     registerTeamTools(compat, runtime);
     registerTeamCommands(compat, runtime);
     // 当前会话若已是某团队成员，订阅宿主完成事件：成员结束会唤醒正在等它的 lead（不轮询）。
-    const teamName = process.env.PI_TEAM_NAME;
+    // 团队上下文来自扩展加载时捕获的 PI_TEAM_NAME（宿主在成员会话创建期注入）。
+    const teamName = runtime.teamName;
     if (teamName) {
         runtime.subscribeHostFinish(teamName);
     }
