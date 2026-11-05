@@ -74,5 +74,13 @@
     "agent-teams",
     "swarm",
     "collaboration"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ojbkxc/pi-team.git"
+  },
+  "homepage": "https://github.com/ojbkxc/pi-team#readme",
+  "bugs": {
+    "url": "https://github.com/ojbkxc/pi-team/issues"
+  }
 }
