@@ -524,6 +524,70 @@ test('未批准的计划不能 launch', async () => {
   assert.match(textOf(launched), /没有待派发的计划/)
 })
 
+// --- 给成员指定模型（providerId 拼接 / team_create 的 effort_level）----------------
+
+test('launch 时 model 拼成 providerId/modelId 传给宿主（多 provider 不丢 provider）', async () => {
+  const team = 'model-launch'
+  await callTool(mock.tools, 'team_create', { team_name: team, spawn: false, members: [] })
+  await callTool(mock.tools, 'team_plan', {
+    operation: 'submit',
+    team_name: team,
+    plan: {
+      members: [
+        { id: 'm1', name: 'w1', agent_type: 'general-purpose', prompt: '做 1', provider_id: 'ty', model_id: 'claude-sonnet-4-6' },
+        { id: 'm2', name: 'w2', agent_type: 'general-purpose', prompt: '做 2', provider_id: 'deepseek', model_id: 'deepseek-v4' },
+      ],
+      tasks: [
+        { id: 't1', subject: 'T1', owner_id: 'm1', dependencies: [] },
+        { id: 't2', subject: 'T2', owner_id: 'm2', dependencies: [] },
+      ],
+    },
+  })
+  await callTool(mock.tools, 'team_plan', { operation: 'approve', team_name: team, request_id: 'req-model-1' })
+  const launched = await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
+  assert.match(textOf(launched), /已派发/)
+
+  const byName = new Map(memory.spawned.map((entry) => [entry.request.name, entry.request]))
+  assert.equal(byName.get('w1').model, 'ty/claude-sonnet-4-6', 'launch 必须把 providerId 拼进 model')
+  assert.equal(byName.get('w2').model, 'deepseek/deepseek-v4', 'launch 必须把 providerId 拼进 model')
+})
+
+test('launch 时 model_id 已含 provider 前缀则不再拼接', async () => {
+  const team = 'model-qualified'
+  await callTool(mock.tools, 'team_create', { team_name: team, spawn: false, members: [] })
+  await callTool(mock.tools, 'team_plan', {
+    operation: 'submit',
+    team_name: team,
+    plan: {
+      members: [{ id: 'm1', name: 'w', agent_type: 'general-purpose', prompt: 'x', provider_id: 'ty', model_id: 'ty/claude' }],
+      tasks: [{ id: 't1', subject: 'T', owner_id: 'm1', dependencies: [] }],
+    },
+  })
+  await callTool(mock.tools, 'team_plan', { operation: 'approve', team_name: team, request_id: 'req-qualified-1' })
+  await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
+  assert.equal(memory.spawned[0].request.model, 'ty/claude', '已带前缀的 modelId 不应被双重拼接')
+})
+
+test('team_create 成员的 effort_level 透传到 host.start 并落盘名册', async () => {
+  const result = await callTool(mock.tools, 'team_create', {
+    team_name: 'effort-team',
+    members: [
+      { name: 'brainy', prompt: '深入思考', effort_level: 'high' },
+      { name: 'plain', prompt: '随便做' },
+    ],
+  })
+  assert.match(textOf(result), /已创建/)
+  assert.equal(memory.spawned.length, 2)
+
+  const byName = new Map(memory.spawned.map((entry) => [entry.request.name, entry.request]))
+  assert.equal(byName.get('brainy').thinking, 'high', 'effort_level 应透传为 thinking')
+  assert.equal(byName.get('plain').thinking, undefined, '未指定时不应传 thinking')
+
+  const { readTeamFileAsync } = await import('../dist/teamHelpers.js')
+  const teamFile = await readTeamFileAsync('effort-team')
+  assert.equal(teamFile.members.find((m) => m.name === 'brainy')?.effortLevel, 'high', 'effortLevel 应落盘名册')
+})
+
 // --- 未读背压（设计文档 §8.4：inbox 上限 8 条未读）---------------------------
 
 test('未读达到上限后背压拒投，且错误信息区分"未读已满"与"被锁住"', async () => {

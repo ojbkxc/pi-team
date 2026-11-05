@@ -270,6 +270,18 @@ function formatReceipt(receipt: { to: string; outcome: string; error?: string; t
   return `${receipt.to}：${label[receipt.outcome] ?? receipt.outcome}${receipt.error ? `（${receipt.error}）` : ''}`
 }
 
+/**
+ * 把计划成员的 runtime 拼成宿主要求的 provider/modelId 形式。
+ * 宿主（subagent-runtime.parseSubagentModel）优先按 provider/modelId 解析；裸 modelId
+ * 只在全局唯一时才成功，同名模型存在于多个 provider 时直接抛 "Subagent model is
+ * ambiguous"。modelId 本身已带 "/"（已是 provider/model 形式）时原样返回，避免双重前缀。
+ */
+function spawnModelFromRuntime(runtime: { providerId?: string; modelId?: string }): string | undefined {
+  const modelId = runtime.modelId?.trim()
+  if (!modelId) return undefined
+  return modelId.includes('/') ? modelId : `${runtime.providerId}/${modelId}`
+}
+
 // ---------------------------------------------------------------------------
 // 工具注册
 // ---------------------------------------------------------------------------
@@ -300,6 +312,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
           prompt: Type.String({ description: '给该成员的完整任务指令' }),
           agent_type: Type.Optional(Type.String({ description: 'Agent 类型预设（如 general-purpose）' })),
           model: Type.Optional(Type.String({ description: '可选的 provider/modelId 覆盖' })),
+          effort_level: Type.Optional(Type.String({ description: '可选思考级别' })),
         }),
         { description: '初始团队成员' },
       ),
@@ -327,6 +340,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
               agentType: member.agent_type || 'general-purpose',
               prompt: member.prompt,
               model: member.model,
+              ...(member.effort_level ? { effortLevel: member.effort_level } : {}),
               joinedAt: now,
               cwd: process.cwd(),
               subscriptions: [] as string[],
@@ -364,6 +378,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
                 teamName: name,
                 agentName: member.name,
                 ...(member.model ? { model: member.model } : {}),
+                ...(member.effort_level ? { thinking: member.effort_level } : {}),
                 runInBackground: true,
               },
               ctx as CompatToolContext,
@@ -442,7 +457,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
           return toolTextResult(JSON.stringify({
             state: plan.state,
             revision: plan.revision,
-            members: plan.members.map((member) => ({ id: member.id, name: member.name, model: member.runtime.modelId })),
+            members: plan.members.map((member) => ({ id: member.id, name: member.name, model: spawnModelFromRuntime(member.runtime) })),
             tasks: plan.tasks,
           }, null, 2))
         }
@@ -528,13 +543,14 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
           const lines: string[] = [`开始派发计划成员（共 ${members.length} 名）：`]
           for (const member of members) {
             try {
+              const spawnModel = spawnModelFromRuntime(member.runtime)
               const handle = await host.start(
                 {
                   name: member.name,
                   profile: member.agentType || 'general-purpose',
                   task: member.prompt,
                   description: `${teamName}/${member.name}`,
-                  ...(member.runtime?.modelId ? { model: member.runtime.modelId } : {}),
+                  ...(spawnModel ? { model: spawnModel } : {}),
                   ...(member.runtime?.effortLevel ? { thinking: member.runtime.effortLevel } : {}),
                   // 成员身份注入（设计文档 §8.4）：宿主据此让成员知道自己不是 lead。
                   teamName,
