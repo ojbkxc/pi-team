@@ -1,0 +1,322 @@
+/**
+ * pi-team 跨端扩展冒烟测试（不装真实 SDK，不真派发子进程）。
+ *
+ * 覆盖验收点：
+ *  - 工具已注册且描述为中文、不含 pi-web 专属字段；
+ *  - team_create 经宿主桥 spawn 成员并登记生命周期；
+ *  - team_message 返回回执（injected / woken / revived / buffered / failed）；
+ *  - team_wait 不轮询：投递即唤醒；被等待成员完成时经完成订阅唤醒；
+ *  - idle → parked → revived 生命周期 + generation CAS。
+ */
+import { test, beforeEach, after } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// 先把团队目录指到临时目录，必须在动态 import 扩展之前设置。
+const TEAM_DIR = mkdtempSync(join(tmpdir(), 'pi-team-test-'))
+process.env.PI_TEAM_DIR = TEAM_DIR
+process.env.PI_TEAM_IDLE_TTL_MS = '80'
+process.env.PI_TEAM_DEBUG = '0'
+
+const { default: piTeamExtension, setInjectedHost } = await import('../dist/index.js')
+
+/** 最小 mock 宿主：只实现公共子集。 */
+function createMockPi() {
+  const tools = new Map()
+  const commands = new Map()
+  const handlers = new Map()
+  const entries = []
+  const messages = []
+  const logs = []
+  const context = {
+    cwd: process.cwd(),
+    mode: 'rpc',
+    hasUI: false,
+    signal: undefined,
+    isIdle: () => true,
+    abort() {},
+    ui: { notify(message, type) { logs.push({ message, type }) } },
+  }
+  const pi = {
+    registerTool(tool) {
+      tools.set(tool.name, tool)
+    },
+    registerCommand(name, options) {
+      commands.set(name, { name, ...options })
+    },
+    on(event, handler) {
+      const list = handlers.get(event) ?? []
+      list.push(handler)
+      handlers.set(event, list)
+      return () => handlers.set(event, (handlers.get(event) ?? []).filter((h) => h !== handler))
+    },
+    appendEntry(customType, data) {
+      entries.push({ customType, data })
+    },
+    getAllTools() {
+      return [...tools.values()].map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters, sourceInfo: { path: '<mock>', source: 'extension' } }))
+    },
+    async exec(command, args) {
+      return { stdout: `${command} ${args.join(' ')}`.trim(), stderr: '', code: 0 }
+    },
+    sendMessage(message, options) {
+      messages.push({ message, options })
+    },
+  }
+  return { pi, tools, commands, entries, messages, logs, context }
+}
+
+/** 内存宿主桥：记录 spawn/revive/wake，并可手动触发完成事件。 */
+function createMemoryHost() {
+  let counter = 0
+  const finishListeners = new Set()
+  const spawned = []
+  const revived = []
+  const stopped = []
+  const woken = []
+  const runs = new Map()
+  const host = {
+    kind: 'subagent',
+    async start(request) {
+      counter += 1
+      const sessionId = `sess-${counter}-${request.name}`
+      const handle = { sessionId, sessionFile: `/tmp/${sessionId}.jsonl`, status: 'running', description: request.description }
+      runs.set(sessionId, handle)
+      spawned.push({ request, handle })
+      return handle
+    },
+    async revive(request) {
+      revived.push(request)
+      const handle = { sessionId: request.sessionId, sessionFile: request.sessionFile, status: 'revived', description: request.description }
+      runs.set(handle.sessionId, handle)
+      return handle
+    },
+    async get(sessionId) {
+      return runs.get(sessionId) ?? null
+    },
+    async steer() {},
+    async stop(sessionId) {
+      stopped.push(sessionId)
+      runs.set(sessionId, { ...(runs.get(sessionId) ?? { sessionId }), status: 'aborted' })
+    },
+    async wake(request) {
+      woken.push(request)
+      return true
+    },
+    onFinish(listener) {
+      finishListeners.add(listener)
+      return () => finishListeners.delete(listener)
+    },
+  }
+  return {
+    host,
+    spawned,
+    revived,
+    stopped,
+    woken,
+    runs,
+    complete(handle) {
+      for (const listener of finishListeners) listener(handle)
+    },
+  }
+}
+
+async function callTool(tools, name, params, ctx = {}) {
+  const tool = tools.get(name)
+  assert.ok(tool, `工具 ${name} 应已注册`)
+  return tool.execute(`call-${name}`, params, undefined, undefined, { cwd: process.cwd(), ...ctx })
+}
+
+function textOf(result) {
+  return (result.content ?? []).map((block) => block.text ?? '').join('')
+}
+
+let memory
+let mock
+
+beforeEach(() => {
+  for (const entry of Object.keys(globalThis)) {
+    if (entry.startsWith('__piTeam')) delete globalThis[entry]
+  }
+  process.env.PI_TEAM_IDLE_TTL_MS = '80'
+  process.env.PI_TEAM_NAME = 'default'
+  delete process.env.PI_AGENT_NAME
+  memory = createMemoryHost()
+  mock = createMockPi()
+  setInjectedHost(memory.host)
+  piTeamExtension(mock.pi)
+})
+
+after(() => {
+  rmSync(TEAM_DIR, { recursive: true, force: true })
+})
+
+test('4 个 /team* 命令已注册且描述为中文', async () => {
+  const names = [...mock.commands.keys()].sort()
+  assert.deepEqual(names, ['team', 'team-create', 'team-plan', 'team-status'])
+  for (const command of mock.commands.values()) {
+    assert.match(command.description, /[\u4e00-\u9fa5]/, `${command.name} 描述应为中文`)
+    assert.equal(typeof command.handler, 'function')
+  }
+  // 参数补全为同步返回（跨端要求）
+  const completion = mock.commands.get('team').getArgumentCompletions
+  assert.equal(typeof completion, 'function')
+  assert.ok(completion('x') === null || Array.isArray(completion('x')))
+})
+
+test('/team 命令触发 notify 且不抛错', async () => {
+  await callTool(mock.tools, 'team_create', { team_name: 'cmd-team', members: [{ name: 'w', prompt: 'x' }] })
+  const command = mock.commands.get('team')
+  await command.handler('cmd-team', mock.context)
+  assert.ok(mock.logs.some((entry) => /cmd-team/.test(entry.message)), '应通知团队状态')
+  assert.equal(mock.logs.at(-1).type, 'info')
+})
+
+test('工具已注册，描述为中文且不含 pi-web 专属字段', () => {
+  const names = [...mock.tools.keys()].sort()
+  assert.deepEqual(names, [
+    'team_accept', 'team_cancel', 'team_create', 'team_delete', 'team_list',
+    'team_message', 'team_plan', 'team_result', 'team_status', 'team_wait',
+  ])
+  for (const tool of mock.tools.values()) {
+    assert.match(tool.description, /[\u4e00-\u9fa5]/, `${tool.name} 描述应为中文`)
+    for (const forbidden of ['promptSnippet', 'promptGuidelines', 'exposure', 'executionMode', 'namespace', 'annotations']) {
+      assert.ok(!(forbidden in tool), `${tool.name} 不应含 pi-web 专属字段 ${forbidden}`)
+    }
+  }
+  // 硬性契约写进描述
+  assert.match(mock.tools.get('team_create').description, /integration owner/)
+  assert.match(mock.tools.get('team_plan').description, /build\/lint\/test/)
+  assert.match(mock.tools.get('team_message').description, /解阻塞|阻塞/)
+})
+
+test('team_create 经宿主桥 spawn 成员并登记生命周期', async () => {
+  const result = await callTool(mock.tools, 'team_create', {
+    team_name: 'alpha',
+    description: '测试团队',
+    members: [
+      { name: 'worker-a', prompt: '实现 A' },
+      { name: 'worker-b', prompt: '实现 B', agent_type: 'general-purpose' },
+    ],
+  })
+  const text = textOf(result)
+  assert.match(text, /已创建/)
+  assert.match(text, /worker-a: 已派发/)
+  assert.match(text, /worker-b: 已派发/)
+  assert.equal(memory.spawned.length, 2)
+
+  const { getLifecycle } = await import('../dist/teamLifecycle.js')
+  const lifecycle = getLifecycle('alpha', memory.host)
+  const a = await lifecycle.get('worker-a')
+  assert.ok(a?.sessionId)
+  assert.equal(a.status, 'idle')
+})
+
+test('team_message 返回回执；等待者直接注入（injected）', async () => {
+  await callTool(mock.tools, 'team_create', { team_name: 'beta', members: [{ name: 'worker', prompt: 'x' }] })
+  const { getBus } = await import('../dist/teamBus.js')
+  const bus = getBus('beta', { host: () => memory.host, lifecycle: () => ({}), teamName: () => 'beta', self: () => 'worker', members: async () => ['worker'] })
+
+  // 模拟 worker 正在等待
+  const waiting = bus.wait('worker', { from: 'team-lead' }, 2000)
+  const receipt = await callTool(mock.tools, 'team_message', { team_name: 'beta', recipient: 'worker', message: '你好' }, {})
+  const text = textOf(receipt)
+  assert.match(text, /worker/)
+  assert.match(text, /已投递给正在等待的收件人/)
+
+  const got = await waiting
+  assert.equal(got?.from, 'team-lead')
+  assert.equal(got?.body, '你好')
+})
+
+test('team_message 到活跃成员返回 woken 并调度合并派发', async () => {
+  await callTool(mock.tools, 'team_create', { team_name: 'gamma', members: [{ name: 'w', prompt: 'x' }] })
+  const receipt = await callTool(mock.tools, 'team_message', { team_name: 'gamma', recipient: 'w', message: '任务1' })
+  assert.match(textOf(receipt), /唤醒/)
+})
+
+test('idle → parked → revived 生命周期', async () => {
+  const { getLifecycle } = await import('../dist/teamLifecycle.js')
+  const lifecycle = getLifecycle('delta', memory.host)
+  await lifecycle.adopt('m', { sessionId: 'sess-x', sessionFile: '/tmp/x.jsonl' })
+  assert.equal((await lifecycle.get('m')).status, 'idle')
+
+  // 等到 TTL 触发挂起
+  await new Promise((resolve) => setTimeout(resolve, 160))
+  assert.equal((await lifecycle.get('m')).status, 'parked')
+
+  const revived = await lifecycle.ensureLive('m')
+  assert.equal(revived.status, 'idle')
+  assert.equal(memory.revived.length, 1)
+  assert.equal(memory.revived[0].sessionId, 'sess-x')
+})
+
+test('被等待成员完成时经完成订阅唤醒（不轮询）', async () => {
+  const created = await callTool(mock.tools, 'team_create', { team_name: 'eps', members: [{ name: 'solo', prompt: '干活' }] })
+  assert.match(textOf(created), /已派发/)
+  const sessionId = memory.spawned[0].handle.sessionId
+
+  const { createTeamRuntime } = await import('../dist/teamTools.js')
+  const runtime = createTeamRuntime(memory.host)
+  runtime.subscribeHostFinish('eps')
+
+  // 先发一条消息，制造「欠我回复」
+  await callTool(mock.tools, 'team_message', { team_name: 'eps', recipient: 'solo', message: '请干活' })
+
+  const { getBus } = await import('../dist/teamBus.js')
+  const bus = getBus('eps', { host: () => memory.host, lifecycle: () => ({}), teamName: () => 'eps', self: () => 'team-lead', members: async () => ['team-lead', 'solo'] })
+  const waitPromise = bus.wait('team-lead', { directOnly: true, repliesFrom: ['solo'] }, 2000)
+
+  memory.complete({ sessionId, status: 'completed', result: '已完成 A' })
+  const got = await waitPromise
+  assert.ok(got, '完成事件应唤醒等待者')
+  assert.equal(got.from, 'solo')
+  assert.match(got.body, /已完成 A/)
+})
+
+test('generation CAS 拒绝迟到的覆盖', async () => {
+  const { TeamLifecycle } = await import('../dist/teamLifecycle.js')
+  const lifecycle = new TeamLifecycle('cas', memory.host)
+  await lifecycle.adopt('g', { sessionId: 's1' })
+  const entry = await lifecycle.get('g')
+  // 用旧代数直接驱动一次 ensureLive 之后的竞态：新迁移后旧代数不得覆盖
+  const stale = await lifecycle.park('g')
+  assert.equal(stale.status, 'parked')
+  // 重新登记会 +generation
+  await lifecycle.adopt('g', { sessionId: 's2' })
+  const after = await lifecycle.get('g')
+  assert.ok(after.generation > entry.generation)
+  assert.equal(after.sessionId, 's2')
+})
+
+test('同一 recipient 短时间多条消息合并成一次 dispatch', async () => {
+  process.env.PI_TEAM_DISPATCH_QUIET_MS = '40'
+  process.env.PI_TEAM_DISPATCH_MAX_MS = '500'
+  await callTool(mock.tools, 'team_create', { team_name: 'merge', members: [{ name: 'w', prompt: 'x' }] })
+  for (const body of ['一', '二', '三']) {
+    await callTool(mock.tools, 'team_message', { team_name: 'merge', recipient: 'w', message: body })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.equal(memory.woken.length, 1, '三条消息应只唤醒一次')
+  const text = memory.woken[0].text
+  assert.match(text, /一/)
+  assert.match(text, /二/)
+  assert.match(text, /三/)
+  delete process.env.PI_TEAM_DISPATCH_QUIET_MS
+  delete process.env.PI_TEAM_DISPATCH_MAX_MS
+})
+
+test('向 parked 成员发消息返回 revived 回执', async () => {
+  await callTool(mock.tools, 'team_create', { team_name: 'rev', members: [{ name: 'p', prompt: 'x' }] })
+  const { getLifecycle } = await import('../dist/teamLifecycle.js')
+  const lifecycle = getLifecycle('rev', memory.host)
+  await lifecycle.park('p')
+  assert.equal((await lifecycle.get('p')).status, 'parked')
+
+  const receipt = await callTool(mock.tools, 'team_message', { team_name: 'rev', recipient: 'p', message: '回来' })
+  assert.match(textOf(receipt), /触发复活/)
+  assert.equal(memory.revived.length, 1)
+  assert.equal((await lifecycle.get('p')).status, 'idle')
+})

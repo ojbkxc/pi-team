@@ -1,0 +1,78 @@
+{
+  "name": "pi-team",
+  "version": "0.2.0",
+  "description": "跨端团队 agent 扩展：一份源码，既是 pi-agent-desktop 内置能力（叠加既有 subagent runtime），又能被 oh-my-pi 从 marketplace 加载。",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./compat": {
+      "types": "./dist/compat.d.ts",
+      "import": "./dist/compat.js"
+    },
+    "./policy": {
+      "types": "./dist/policy.d.ts",
+      "import": "./dist/policy.js"
+    }
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:real": "tsc -p tsconfig.real.json",
+    "test": "npm run build && node --test test/team.test.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.4.0 <2.0.0",
+    "typebox": ">=1.3.0 <2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@earendil-works/pi-tui": "^1.5.0",
+    "@types/node": "^22.20.5",
+    "@types/proper-lockfile": "^4.1.4",
+    "typebox": "1.3.27",
+    "typescript": "5.7"
+  },
+  "keywords": [
+    "pi",
+    "pi-agent-desktop",
+    "oh-my-pi",
+    "agent-teams",
+    "swarm",
+    "collaboration"
+  ]
+}
