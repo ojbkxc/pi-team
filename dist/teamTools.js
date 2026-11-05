@@ -16,6 +16,7 @@ import { writeTeamFileAsync, readTeamFileAsync, deleteTeamDir, listTeamNames, } 
 import { approveTeamPlan, claimPlanLaunch, completePlanLaunch, ensureTeamDraft, failPlanLaunch, readTeamPlan, replaceTeamPlan, submitTeamPlan, TeamPlanError, } from './teamPlanStore.js';
 import { getLifecycle, dropLifecycle } from './teamLifecycle.js';
 import { getBus, dropBus } from './teamBus.js';
+import * as tickets from './teamTickets.js';
 // ---------------------------------------------------------------------------
 // 运行环境
 // ---------------------------------------------------------------------------
@@ -780,6 +781,201 @@ export function registerTeamTools(compat, runtime) {
             }
             catch (error) {
                 return toolErrorResult(`team_list 失败：${errorMessage(error)}`);
+            }
+        },
+    }));
+    // --- team_ticket -------------------------------------------------------
+    // 工单三段式（设计文档 §10 Phase 4 步骤 1–3）。新增工具而非改 team_message 的语义，
+    // 保持既有 10 个工具的入参与返回格式不变。
+    compat.registerTool(defineCompatTool({
+        name: 'team_ticket',
+        label: '工单',
+        description: '管理工单（Ticket / Mandate / Assignment 三段式）。\n\n' +
+            'operation:\n' +
+            '  create   建工单，可选 mandate（不可变授权）与 assignees（初始派活）\n' +
+            '  list     列出本团队工单（含状态与 assignment 汇总）\n' +
+            '  show     看单个工单详情（mandates / assignments / 订阅者 / 讨论帖）\n' +
+            '  mandate  追加一条不可变 Mandate；要变更用法是新建 + 用 revokes 撤销旧的\n' +
+            '  assign   给工单派新活（同一工单可多个 assignment，状态各自独立）\n' +
+            '  progress 推进 assignment：status=running|ended，ended 可带 outcome 与 result\n' +
+            '  end      结束工单（open → ended）\n' +
+            '  subscribe 设置订阅者：工单上的后续讨论会扇出给他们\n' +
+            '  post     在工单讨论帖发言，并按订阅关系扇出（走团队邮箱投递）\n' +
+            '  ack      对某条消息回执已读；unacked 查询还没确认的\n\n' +
+            'Mandate 不可变是这个模型的核心：历史授权只能被撤销，不能被改写。',
+        parameters: Type.Object({
+            operation: Type.Union([
+                Type.Literal('create'),
+                Type.Literal('list'),
+                Type.Literal('show'),
+                Type.Literal('mandate'),
+                Type.Literal('assign'),
+                Type.Literal('progress'),
+                Type.Literal('end'),
+                Type.Literal('subscribe'),
+                Type.Literal('post'),
+                Type.Literal('ack'),
+                Type.Literal('unacked'),
+            ], { description: '操作类型' }),
+            team_name: Type.Optional(Type.String({ description: '团队名；缺省用当前团队上下文' })),
+            ticket_id: Type.Optional(Type.String({ description: 'create 以外的操作必需' })),
+            subject: Type.Optional(Type.String({ description: 'create：工单标题' })),
+            description: Type.Optional(Type.String({ description: 'create：工单描述' })),
+            mandate: Type.Optional(Type.String({ description: 'create/mandate：授权内容' })),
+            revokes: Type.Optional(Type.String({ description: 'mandate：要撤销的旧 mandate id' })),
+            assignees: Type.Optional(Type.Array(Type.String(), { description: 'create：初始承接者名字' })),
+            assignee: Type.Optional(Type.String({ description: 'assign：承接者名字' })),
+            assignment_id: Type.Optional(Type.String({ description: 'progress：assignment id' })),
+            status: Type.Optional(Type.String({ description: 'progress：running | ended' })),
+            outcome: Type.Optional(Type.String({ description: 'progress：completed | failed | cancelled' })),
+            result: Type.Optional(Type.String({ description: 'progress：结果摘要' })),
+            subscribers: Type.Optional(Type.Array(Type.String(), { description: 'subscribe：订阅者名字列表' })),
+            text: Type.Optional(Type.String({ description: 'post：讨论内容' })),
+            message_id: Type.Optional(Type.String({ description: 'ack：被确认的消息 id' })),
+            expected: Type.Optional(Type.Array(Type.Object({
+                message_id: Type.String({ description: '消息 id' }),
+                readers: Type.Array(Type.String(), { description: '应确认的人' }),
+            }), { description: 'unacked：期望被确认的消息与读者' })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            try {
+                const name = params.team_name || resolveTeamContext(runtime.teamName);
+                if (!name)
+                    return toolErrorResult('未指定团队名，且当前会话没有团队上下文。');
+                const team = await readTeamFileAsync(name);
+                if (!team)
+                    return toolErrorResult(`团队 "${name}" 不存在。`);
+                const self = resolveAgentName(runtime.agentName) || TEAM_LEAD_NAME;
+                const ticketId = params.ticket_id?.trim();
+                const needTicket = () => {
+                    if (!ticketId)
+                        throw new Error(`${params.operation} 需要 ticket_id。`);
+                    return ticketId;
+                };
+                switch (params.operation) {
+                    case 'create': {
+                        if (!params.subject?.trim())
+                            return toolErrorResult('create 需要 subject。');
+                        const ticket = await tickets.createTicket({
+                            teamName: name,
+                            subject: params.subject,
+                            ...(params.description ? { description: params.description } : {}),
+                            createdBy: self,
+                            ...(params.mandate ? { mandateStatement: params.mandate } : {}),
+                            assignees: (params.assignees ?? []).map((assignee) => ({ assignee })),
+                        });
+                        return toolTextResult(`工单已创建：${ticket.id}\n标题：${ticket.subject}\n` +
+                            `mandates ${ticket.mandates.length} 条，assignments ${ticket.assignments.length} 个。`);
+                    }
+                    case 'list': {
+                        const all = await tickets.listTickets(name);
+                        if (all.length === 0)
+                            return toolTextResult('本团队暂无工单。');
+                        const lines = all.map((ticket) => {
+                            const running = ticket.assignments.filter((assignment) => assignment.status === 'running').length;
+                            const ended = ticket.assignments.filter((assignment) => assignment.status === 'ended').length;
+                            return `- ${ticket.id} [${ticket.status}] ${ticket.subject} — assignments ${ticket.assignments.length}（running ${running} / ended ${ended}），订阅 ${ticket.subscribers.length}`;
+                        });
+                        return toolTextResult(lines.join('\n'));
+                    }
+                    case 'show': {
+                        const ticket = await tickets.readTicket(name, needTicket());
+                        if (!ticket)
+                            return toolErrorResult(`工单 ${ticketId} 不存在。`);
+                        return toolTextResult(JSON.stringify({
+                            id: ticket.id,
+                            subject: ticket.subject,
+                            status: ticket.status,
+                            mandates: ticket.mandates,
+                            assignments: ticket.assignments,
+                            subscribers: ticket.subscribers,
+                            thread: ticket.thread,
+                        }, null, 2));
+                    }
+                    case 'mandate': {
+                        if (!params.mandate?.trim())
+                            return toolErrorResult('mandate 需要 mandate 内容。');
+                        const { ticket, mandate } = await tickets.addMandate(name, needTicket(), {
+                            statement: params.mandate,
+                            issuedBy: self,
+                            ...(params.revokes ? { revokes: params.revokes } : {}),
+                        });
+                        return toolTextResult(`已追加 Mandate ${mandate.id}${params.revokes ? `（并撤销 ${params.revokes}）` : ''}。` +
+                            `当前 ${ticket.mandates.length} 条。`);
+                    }
+                    case 'assign': {
+                        if (!params.assignee?.trim())
+                            return toolErrorResult('assign 需要 assignee。');
+                        const { ticket, assignment } = await tickets.addAssignment(name, needTicket(), { assignee: params.assignee });
+                        return toolTextResult(`已派活：${assignment.id} → ${assignment.assignee}（pending）。工单现有 ${ticket.assignments.length} 个 assignment。`);
+                    }
+                    case 'progress': {
+                        if (!params.assignment_id?.trim())
+                            return toolErrorResult('progress 需要 assignment_id。');
+                        const status = params.status?.trim();
+                        if (status !== 'running' && status !== 'ended')
+                            return toolErrorResult('progress 的 status 必须是 running 或 ended。');
+                        const outcome = params.outcome?.trim();
+                        if (outcome && !['completed', 'failed', 'cancelled'].includes(outcome)) {
+                            return toolErrorResult('outcome 必须是 completed / failed / cancelled。');
+                        }
+                        const { assignment } = await tickets.setAssignmentStatus(name, needTicket(), params.assignment_id, {
+                            status,
+                            ...(params.result !== undefined ? { result: params.result } : {}),
+                            ...(outcome ? { outcome: outcome } : {}),
+                        });
+                        return toolTextResult(`Assignment ${assignment.id} → ${assignment.status}${assignment.outcome ? `（${assignment.outcome}）` : ''}。`);
+                    }
+                    case 'end': {
+                        const ticket = await tickets.endTicket(name, needTicket());
+                        return toolTextResult(`工单 ${ticket.id} 已结束（ended）。`);
+                    }
+                    case 'subscribe': {
+                        const ticket = await tickets.setSubscribers(name, needTicket(), params.subscribers ?? []);
+                        const unknown = ticket.subscribers.filter((subscriber) => !team.members.some((member) => member.name === subscriber));
+                        return toolTextResult(`订阅者已设为：${ticket.subscribers.join('、') || '（空）'}。` +
+                            (unknown.length ? `\n注意：${unknown.join('、')} 不是该团队成员。` : ''));
+                    }
+                    case 'post': {
+                        if (!params.text?.trim())
+                            return toolErrorResult('post 需要 text。');
+                        const { ticket, fanout } = await tickets.postToThread(name, needTicket(), { from: self, text: params.text });
+                        const env = runtime.envFor(name);
+                        const receipts = [];
+                        for (const recipient of fanout) {
+                            const receipt = await env.bus.send({
+                                from: self,
+                                to: recipient,
+                                body: `[工单 ${ticket.id}] ${params.text}`,
+                                summary: ticket.subject,
+                            });
+                            receipts.push(`  - ${recipient}: ${receipt.outcome}`);
+                        }
+                        return toolTextResult(`已记入工单 ${ticket.id} 的讨论帖。` +
+                            (fanout.length ? `\n扇出给 ${fanout.length} 名订阅者：\n${receipts.join('\n')}` : '\n（无订阅者，未扇出。）'));
+                    }
+                    case 'ack': {
+                        if (!params.message_id?.trim())
+                            return toolErrorResult('ack 需要 message_id。');
+                        const receipt = await tickets.recordAck(name, params.message_id, self);
+                        return toolTextResult(`已回执：${receipt.messageId} 被 ${receipt.reader} 于 ${new Date(receipt.ackedAt).toISOString()} 确认。`);
+                    }
+                    case 'unacked': {
+                        const expected = (params.expected ?? []).map((entry) => ({ messageId: entry.message_id, readers: entry.readers }));
+                        if (expected.length === 0)
+                            return toolTextResult('未提供 expected；无需检查。');
+                        const missing = await tickets.listUnacked(name, expected);
+                        if (missing.length === 0)
+                            return toolTextResult('全部已确认。');
+                        return toolTextResult(`还有 ${missing.length} 条未确认：\n` +
+                            missing.map((entry) => `  - ${entry.messageId} ← ${entry.reader}`).join('\n'));
+                    }
+                    default:
+                        return toolErrorResult(`未知 operation：${String(params.operation)}`);
+                }
+            }
+            catch (error) {
+                return toolErrorResult(`team_ticket 失败：${errorMessage(error)}`);
             }
         },
     }));

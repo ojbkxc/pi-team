@@ -178,7 +178,7 @@ test('工具已注册，描述为中文且不含 pi-web 专属字段', () => {
   const names = [...mock.tools.keys()].sort()
   assert.deepEqual(names, [
     'team_accept', 'team_cancel', 'team_create', 'team_delete', 'team_list',
-    'team_message', 'team_plan', 'team_result', 'team_status', 'team_wait',
+    'team_message', 'team_plan', 'team_result', 'team_status', 'team_ticket', 'team_wait',
   ])
   for (const tool of mock.tools.values()) {
     assert.match(tool.description, /[\u4e00-\u9fa5]/, `${tool.name} 描述应为中文`)
