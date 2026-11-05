@@ -18,7 +18,12 @@ import {
   type CompatApi,
   type CompatToolContext,
 } from './compat.js'
-import { TEAM_LEAD_NAME } from './constants.js'
+import {
+  TEAM_LEAD_NAME,
+  TEAM_LIMIT_PREFIX,
+  getMaxGlobalWorkers,
+  getMaxMembersPerTeam,
+} from './constants.js'
 import {
   writeTeamFileAsync,
   readTeamFileAsync,
@@ -43,6 +48,61 @@ import type { MemberRunHandle, TeamHost } from './teamHost.js'
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 统计全进程当前活跃的 worker 数（不含 team-lead），用于全局上限判断。
+ *
+ * 团队数据都在磁盘上（~/.pi/agent/teams/<team>/config.json），所以统计要跨所有团队。
+ * `excludeTeam` 用来跳过调用方自己：team_create 是先落盘名册再派发，若把自己也算进
+ * 基数，新建团队第一次派发就会自我判超限。读不到的文件直接跳过 —— 一个坏掉的团队
+ * 目录不该让别的团队也派不出人。
+ */
+async function countActiveWorkers(excludeTeam?: string): Promise<number> {
+  let total = 0
+  for (const teamName of await listTeamNames()) {
+    if (excludeTeam && teamName === excludeTeam) continue
+    try {
+      const teamFile = await readTeamFileAsync(teamName)
+      if (!teamFile) continue
+      total += teamFile.members.filter((member) => member.name !== TEAM_LEAD_NAME).length
+    } catch {
+      // 坏掉的团队目录不参与统计，也不阻断派发。
+    }
+  }
+  return total
+}
+
+/**
+ * 派发前的上限检查（设计文档 §8：8 / 32）。
+ *
+ * 两个上限都要查，因为它们的拒绝原因对调用方意义不同：per-team 说明「你的团队已经
+ * 满了，删点人或拆团队」；global 说明「别的团队占着名额，等它们收工」。
+ */
+async function checkSpawnLimits(
+  teamName: string,
+  requestedWorkerCount: number,
+): Promise<string | null> {
+  const perTeamLimit = getMaxMembersPerTeam()
+  if (requestedWorkerCount > perTeamLimit) {
+    return (
+      `${TEAM_LIMIT_PREFIX}: per-team worker limit reached (${perTeamLimit}). ` +
+      `团队 "${teamName}" 本次要派发 ${requestedWorkerCount} 名成员，超过每团队上限 ${perTeamLimit}。` +
+      `请拆成多个团队，或减少成员数量。`
+    )
+  }
+
+  const globalLimit = getMaxGlobalWorkers()
+  const activeWorkers = await countActiveWorkers(teamName)
+  if (activeWorkers + requestedWorkerCount > globalLimit) {
+    return (
+      `${TEAM_LIMIT_PREFIX}: global worker limit reached (${globalLimit}). ` +
+      `当前全进程已有 ${activeWorkers} 名活跃成员，再派发 ${requestedWorkerCount} 名会超过上限 ${globalLimit}。` +
+      `请等待其他团队的成员收工，或先 team_delete 不再需要的团队。`
+    )
+  }
+
+  return null
 }
 
 function currentTeamName(): string | undefined {
@@ -243,6 +303,15 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
           lines.push('未派发成员（spawn=false）。用 team_plan 提交计划，或在计划获批后派发。')
           return toolTextResult(lines.join('\n'))
         }
+
+        // 上限检查用「其他团队」的活跃数：本团队刚落盘，它自己这次要派的人还没起，
+        // 不该被自己算进基数（否则第一次派发就会把自己判超限）。
+        const limitError = await checkSpawnLimits(name, params.members.length)
+        if (limitError) {
+          // 团队本身已创建（成员名册有效），只是没有派发；让调用方决定是缩减还是稍后重试。
+          return toolErrorResult(`${limitError}\n团队 "${name}" 已创建但未派发任何成员。`)
+        }
+
         for (const member of params.members) {
           try {
             const handle = await host.start(

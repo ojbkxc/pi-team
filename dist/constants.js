@@ -65,6 +65,32 @@ export function getDispatchMaxWaitMs() {
 }
 /** 已派发消息在收件人邮箱里的容量上限，超出的最旧消息被丢弃。 */
 export const MAILBOX_CAP = 200;
+// ---------------------------------------------------------------------------
+// 并发上限（设计文档 §8「8 / 32 + 人类优先槽」）
+//
+// PI-Desktop 的 4/16 偏保守（单父 4 个 worker 在大型重构里不够用），这里取
+// 8（每父会话，正好对应泳道的 8 条可见 lane）与 32（全进程，受内存与 provider
+// 限流约束）的平衡。上限拒绝必须区分原因，否则调用方分不清是「自己派多了」
+// 还是「全局被别人占满了」。
+// ---------------------------------------------------------------------------
+/** 单个父会话可同时活跃的 worker 数（不含 team-lead）。可用 PI_TEAM_MAX_MEMBERS 覆盖。 */
+export const DEFAULT_MAX_MEMBERS_PER_TEAM = 8;
+/** 全进程可同时活跃的 worker 总数（跨所有团队）。可用 PI_TEAM_MAX_GLOBAL_WORKERS 覆盖。 */
+export const DEFAULT_MAX_GLOBAL_WORKERS = 32;
+function positiveIntFromEnv(name, fallback) {
+    const raw = process.env[name];
+    const parsed = raw === undefined ? NaN : Number(raw);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+/** 每团队成员上限（支持环境覆盖）。 */
+export function getMaxMembersPerTeam() {
+    return positiveIntFromEnv('PI_TEAM_MAX_MEMBERS', DEFAULT_MAX_MEMBERS_PER_TEAM);
+}
+/** 全局 worker 上限（支持环境覆盖）。 */
+export function getMaxGlobalWorkers() {
+    return positiveIntFromEnv('PI_TEAM_MAX_GLOBAL_WORKERS', DEFAULT_MAX_GLOBAL_WORKERS);
+}
+export const TEAM_LIMIT_PREFIX = 'LIMIT_EXCEEDED';
 /** 成员空闲多久后进入 parked（挂起）。<= 0 关闭自动挂起。默认 2 分钟。 */
 export const DEFAULT_IDLE_TTL_MS = 120_000;
 /**

@@ -50,6 +50,17 @@ export declare function getDispatchQuietWindowMs(): number;
 export declare function getDispatchMaxWaitMs(): number;
 /** 已派发消息在收件人邮箱里的容量上限，超出的最旧消息被丢弃。 */
 export declare const MAILBOX_CAP = 200;
+/** 单个父会话可同时活跃的 worker 数（不含 team-lead）。可用 PI_TEAM_MAX_MEMBERS 覆盖。 */
+export declare const DEFAULT_MAX_MEMBERS_PER_TEAM = 8;
+/** 全进程可同时活跃的 worker 总数（跨所有团队）。可用 PI_TEAM_MAX_GLOBAL_WORKERS 覆盖。 */
+export declare const DEFAULT_MAX_GLOBAL_WORKERS = 32;
+/** 每团队成员上限（支持环境覆盖）。 */
+export declare function getMaxMembersPerTeam(): number;
+/** 全局 worker 上限（支持环境覆盖）。 */
+export declare function getMaxGlobalWorkers(): number;
+/** 上限拒绝的错误类型：调用方据此区分「本团队满了」与「全局满了」。 */
+export type TeamLimitKind = 'per-team' | 'global';
+export declare const TEAM_LIMIT_PREFIX = "LIMIT_EXCEEDED";
 /** 成员空闲多久后进入 parked（挂起）。<= 0 关闭自动挂起。默认 2 分钟。 */
 export declare const DEFAULT_IDLE_TTL_MS = 120000;
 /**

@@ -320,3 +320,51 @@ test('向 parked 成员发消息返回 revived 回执', async () => {
   assert.equal(memory.revived.length, 1)
   assert.equal((await lifecycle.get('p')).status, 'idle')
 })
+
+// --- 并发上限（设计文档 §8：8 / 32）------------------------------------------
+
+test('超出每团队上限时拒绝派发，且团队已创建但无成员被 spawn', async () => {
+  process.env.PI_TEAM_MAX_MEMBERS = '2'
+  try {
+    const members = [
+      { name: 'a', prompt: 'x' },
+      { name: 'b', prompt: 'x' },
+      { name: 'c', prompt: 'x' },
+    ]
+    const result = await callTool(mock.tools, 'team_create', { team_name: 'limit-per-team', members })
+    const text = textOf(result)
+    assert.match(text, /LIMIT_EXCEEDED: per-team worker limit reached \(2\)/)
+    assert.match(text, /已创建但未派发任何成员/)
+    // 团队名册仍然有效，只是没有派发。
+    const { readTeamFileAsync } = await import('../dist/teamHelpers.js')
+    const teamFile = await readTeamFileAsync('limit-per-team')
+    assert.equal(teamFile.members.length, 4, 'team-lead + 3 名成员应已登记')
+  } finally {
+    delete process.env.PI_TEAM_MAX_MEMBERS
+  }
+})
+
+test('超出全局上限时拒绝派发，拒绝消息区分 global', async () => {
+  process.env.PI_TEAM_MAX_GLOBAL_WORKERS = '2'
+  // 全局计数跨所有团队，所以先把前面测试留下的团队清掉，否则基数不是 0。
+  const { listTeamNames, deleteTeamDir } = await import('../dist/teamHelpers.js')
+  for (const name of await listTeamNames()) await deleteTeamDir(name)
+  try {
+    // 先占满全局：第一个团队派 2 名成员。
+    const first = await callTool(mock.tools, 'team_create', {
+      team_name: 'limit-global-a',
+      members: [{ name: 'x', prompt: 'x' }, { name: 'y', prompt: 'x' }],
+    })
+    assert.doesNotMatch(textOf(first), /LIMIT_EXCEEDED/, '第一队应正常派发')
+
+    // 第二个团队再派 1 名就超了。
+    const second = await callTool(mock.tools, 'team_create', {
+      team_name: 'limit-global-b',
+      members: [{ name: 'z', prompt: 'x' }],
+    })
+    const text = textOf(second)
+    assert.match(text, /LIMIT_EXCEEDED: global worker limit reached \(2\)/)
+  } finally {
+    delete process.env.PI_TEAM_MAX_GLOBAL_WORKERS
+  }
+})
