@@ -14,7 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { open, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import * as lockfile from 'proper-lockfile';
-import { getTeamsDir, TEAM_LEAD_NAME } from './constants.js';
+import { getTeamsDir, TEAM_LEAD_NAME, getMaxUnread } from './constants.js';
 import { sanitizePathComponent } from './teamHelpers.js';
 function logDebug(message) {
     if (process.env.PI_TEAM_DEBUG)
@@ -311,7 +311,21 @@ export async function writeToMailbox(recipientName, message, teamName) {
                 throw error;
         }
         const newMessage = createMailboxMessage(message);
-        await updateInbox(inboxPath, messages => [...messages, newMessage]);
+        let full = false;
+        await updateInbox(inboxPath, messages => {
+            // 未读背压（设计文档 §8.4）：收件人堆了太多未读就拒投，让调用方知道
+            // 该等它先处理完。已读条目会被 updateInbox 移出 inbox，所以只看未读。
+            const limit = getMaxUnread();
+            if (limit > 0 && messages.length >= limit) {
+                full = true;
+                return messages;
+            }
+            return [...messages, newMessage];
+        });
+        if (full) {
+            logDebug(`inbox for ${recipientName} reached its unread limit (${getMaxUnread()}); message not delivered`);
+            return false;
+        }
         return true;
     }
     catch (error) {

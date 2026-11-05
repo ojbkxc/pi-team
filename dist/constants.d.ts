@@ -50,6 +50,9 @@ export declare function getDispatchQuietWindowMs(): number;
 export declare function getDispatchMaxWaitMs(): number;
 /** 已派发消息在收件人邮箱里的容量上限，超出的最旧消息被丢弃。 */
 export declare const MAILBOX_CAP = 200;
+/** 单个收件人允许堆积的未读消息数。 */
+export declare const DEFAULT_MAX_UNREAD = 8;
+export declare function getMaxUnread(): number;
 /** 单个父会话可同时活跃的 worker 数（不含 team-lead）。可用 PI_TEAM_MAX_MEMBERS 覆盖。 */
 export declare const DEFAULT_MAX_MEMBERS_PER_TEAM = 8;
 /** 全进程可同时活跃的 worker 总数（跨所有团队）。可用 PI_TEAM_MAX_GLOBAL_WORKERS 覆盖。 */

@@ -10,7 +10,7 @@
  * 本类只额外管理进程内的等待者、发送标记与合并派发。
  */
 import { readUnreadMessages, writeToMailbox, claimMailboxMessages, formatTeammateMessages, } from './teammateMailbox.js';
-import { getDispatchQuietWindowMs, getDispatchMaxWaitMs, isHumanPriorityEnabled, HUMAN_SENDER_NAME, } from './constants.js';
+import { getDispatchQuietWindowMs, getDispatchMaxWaitMs, getMaxUnread, isHumanPriorityEnabled, HUMAN_SENDER_NAME, } from './constants.js';
 export function busWaitAccepts(filter, message) {
     if (filter.from !== undefined && message.from !== filter.from)
         return false;
@@ -135,7 +135,19 @@ export class TeamBus {
             timestamp: new Date(mark.ts).toISOString(),
         }, this.#ctx.teamName());
         if (!persisted) {
-            return { to: options.to, messageId, outcome: 'failed', error: `收件人 ${options.to} 的邮箱暂不可写（可能被锁住）。` };
+            // writeToMailbox 既可能是被锁住，也可能是未读已满被背压拒投。后者要让发送方
+            // 知道该等对方处理，而不是误以为可以立刻重试。
+            const unread = await readUnreadMessages(options.to, this.#ctx.teamName()).catch(() => []);
+            const limit = getMaxUnread();
+            const full = limit > 0 && unread.length >= limit;
+            return {
+                to: options.to,
+                messageId,
+                outcome: 'failed',
+                error: full
+                    ? `收件人 ${options.to} 的未读已达上限 ${limit} 条，消息被拒投（背压）。等它处理完未读再发。`
+                    : `收件人 ${options.to} 的邮箱暂不可写（可能被锁住）。`,
+            };
         }
         // 3) 判定投递结果并调度合并唤醒。
         const entry = await this.#ctx.lifecycle().get(options.to);

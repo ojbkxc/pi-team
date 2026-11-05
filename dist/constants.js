@@ -66,6 +66,29 @@ export function getDispatchMaxWaitMs() {
 /** 已派发消息在收件人邮箱里的容量上限，超出的最旧消息被丢弃。 */
 export const MAILBOX_CAP = 200;
 // ---------------------------------------------------------------------------
+// 未读背压（设计文档 §8.4「worker 邮箱 inbox 上限 8 条未读」）
+//
+// 与 MAILBOX_CAP 语义不同：那条管「邮箱总共能存多少」，这条管「还没被读的能堆多少」。
+// 目的不是省空间，是给一个明显失联的 worker 踩刹车 —— 它一直不读信时继续灌，
+// 只会让它醒来面对一堆过期指令。
+//
+// 注意别把它做成对「连发多条」的误伤：teamBus 有静默合并窗口，lead 连着发 8 条
+// 本来是合成一次唤醒的正常用法。所以阈值取 8 只作为**默认背压点**，且
+// PI_TEAM_MAX_UNREAD=0 可完全关闭。
+// ---------------------------------------------------------------------------
+/** 单个收件人允许堆积的未读消息数。 */
+export const DEFAULT_MAX_UNREAD = 8;
+export function getMaxUnread() {
+    const raw = process.env.PI_TEAM_MAX_UNREAD;
+    if (raw === undefined)
+        return DEFAULT_MAX_UNREAD;
+    const parsed = Number(raw);
+    // 0（或负数/非法值）表示不限制。
+    if (!Number.isFinite(parsed) || parsed <= 0)
+        return 0;
+    return Math.floor(parsed);
+}
+// ---------------------------------------------------------------------------
 // 并发上限（设计文档 §8「8 / 32 + 人类优先槽」）
 //
 // PI-Desktop 的 4/16 偏保守（单父 4 个 worker 在大型重构里不够用），这里取

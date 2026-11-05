@@ -523,3 +523,55 @@ test('未批准的计划不能 launch', async () => {
   const launched = await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
   assert.match(textOf(launched), /没有待派发的计划/)
 })
+
+// --- 未读背压（设计文档 §8.4：inbox 上限 8 条未读）---------------------------
+
+test('未读达到上限后背压拒投，且错误信息区分"未读已满"与"被锁住"', async () => {
+  process.env.PI_TEAM_MAX_UNREAD = '3'
+  try {
+    await callTool(mock.tools, 'team_create', { team_name: 'backpressure', spawn: false, members: [{ name: 'busy', prompt: 'x' }] })
+
+    // 收件人没有活跃会话 → 消息只会落盘、不会被执行，未读因此越攒越多。
+    const { getBus } = await import('../dist/teamBus.js')
+    const bus = getBus('backpressure', memory.host)
+
+    const outcomes = []
+    for (let i = 1; i <= 5; i++) {
+      const receipt = await bus.send({ from: 'team-lead', to: 'busy', body: `第 ${i} 条` })
+      outcomes.push(receipt)
+    }
+
+    // 前 3 条落盘成功（buffered），第 4 条起被背压拒投。
+    assert.equal(outcomes[0].outcome, 'buffered')
+    assert.equal(outcomes[2].outcome, 'buffered')
+    assert.equal(outcomes[3].outcome, 'failed')
+    assert.match(outcomes[3].error, /未读已达上限 3 条/)
+    assert.match(outcomes[3].error, /背压/)
+    assert.equal(outcomes[4].outcome, 'failed')
+
+    // 拒投的消息不应写进邮箱：未读数仍是 3。
+    const { readUnreadMessages } = await import('../dist/teammateMailbox.js')
+    const unread = await readUnreadMessages('busy', 'backpressure')
+    assert.equal(unread.length, 3, `未读数应停在 3，实际 ${unread.length}`)
+  } finally {
+    delete process.env.PI_TEAM_MAX_UNREAD
+  }
+})
+
+test('PI_TEAM_MAX_UNREAD=0 关闭背压', async () => {
+  process.env.PI_TEAM_MAX_UNREAD = '0'
+  try {
+    await callTool(mock.tools, 'team_create', { team_name: 'no-backpressure', spawn: false, members: [{ name: 'idle-worker', prompt: 'x' }] })
+    const { getBus } = await import('../dist/teamBus.js')
+    const bus = getBus('no-backpressure', memory.host)
+
+    for (let i = 1; i <= 12; i++) {
+      const receipt = await bus.send({ from: 'team-lead', to: 'idle-worker', body: `第 ${i} 条` })
+      assert.equal(receipt.outcome, 'buffered', `第 ${i} 条不应被拒`)
+    }
+    const { readUnreadMessages } = await import('../dist/teammateMailbox.js')
+    assert.equal((await readUnreadMessages('idle-worker', 'no-backpressure')).length, 12)
+  } finally {
+    delete process.env.PI_TEAM_MAX_UNREAD
+  }
+})
