@@ -575,3 +575,33 @@ test('PI_TEAM_MAX_UNREAD=0 关闭背压', async () => {
     delete process.env.PI_TEAM_MAX_UNREAD
   }
 })
+
+// --- 默认上限值（不设环境变量时的真实行为）-----------------------------------
+
+test('默认上限：每团队 12 / 全局 32，未设环境变量时生效', async () => {
+  const { getMaxMembersPerTeam, getMaxGlobalWorkers } = await import('../dist/constants.js')
+  delete process.env.PI_TEAM_MAX_MEMBERS
+  delete process.env.PI_TEAM_MAX_GLOBAL_WORKERS
+  assert.equal(getMaxMembersPerTeam(), 12, '每团队默认应为 12')
+  assert.equal(getMaxGlobalWorkers(), 32, '全局默认应为 32')
+
+  // 环境变量可覆盖，非法值回落默认。
+  process.env.PI_TEAM_MAX_MEMBERS = '5'
+  assert.equal(getMaxMembersPerTeam(), 5)
+  process.env.PI_TEAM_MAX_MEMBERS = 'abc'
+  assert.equal(getMaxMembersPerTeam(), 12, '非法值应回落默认')
+  delete process.env.PI_TEAM_MAX_MEMBERS
+  delete process.env.PI_TEAM_MAX_GLOBAL_WORKERS
+})
+
+test('12 名成员可以派发，第 13 名被拒', async () => {
+  delete process.env.PI_TEAM_MAX_MEMBERS
+  delete process.env.PI_TEAM_MAX_GLOBAL_WORKERS
+  const members = Array.from({ length: 13 }, (_, i) => ({ name: `m${i + 1}`, prompt: 'x' }))
+  const result = await callTool(mock.tools, 'team_create', { team_name: 'twelve', spawn: false, members })
+  assert.doesNotMatch(textOf(result), /LIMIT_EXCEEDED/, 'spawn=false 时不应触发上限')
+
+  // spawn=false 只登记不派发；再用 13 人做一次带 spawn 的检查。
+  const spawned = await callTool(mock.tools, 'team_create', { team_name: 'thirteen', members })
+  assert.match(textOf(spawned), /LIMIT_EXCEEDED: per-team worker limit reached \(12\)/, textOf(spawned))
+})

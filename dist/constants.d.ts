@@ -54,7 +54,7 @@ export declare const MAILBOX_CAP = 200;
 export declare const DEFAULT_MAX_UNREAD = 8;
 export declare function getMaxUnread(): number;
 /** 单个父会话可同时活跃的 worker 数（不含 team-lead）。可用 PI_TEAM_MAX_MEMBERS 覆盖。 */
-export declare const DEFAULT_MAX_MEMBERS_PER_TEAM = 8;
+export declare const DEFAULT_MAX_MEMBERS_PER_TEAM = 12;
 /** 全进程可同时活跃的 worker 总数（跨所有团队）。可用 PI_TEAM_MAX_GLOBAL_WORKERS 覆盖。 */
 export declare const DEFAULT_MAX_GLOBAL_WORKERS = 32;
 /** 每团队成员上限（支持环境覆盖）。 */
