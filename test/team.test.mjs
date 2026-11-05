@@ -462,3 +462,64 @@ test('扩展加载时捕获的成员身份在环境变量恢复后仍生效', as
   })
   assert.match(textOf(result), /仅限 team-lead/)
 })
+
+// --- Phase 4 步骤 5：审批后自动派发 ------------------------------------------
+
+test('计划批准后 launch 会派发成员；重复 launch 不重复派发', async () => {
+  const team = 'launch-team'
+  await callTool(mock.tools, 'team_create', { team_name: team, spawn: false, members: [] })
+
+  // 提交计划：两名成员、两个任务。
+  await callTool(mock.tools, 'team_plan', {
+    operation: 'submit',
+    team_name: team,
+    plan: {
+      members: [
+        { id: 'm1', name: 'w1', agent_type: 'general-purpose', prompt: '做 1', provider_id: 'p', model_id: 'mm' },
+        { id: 'm2', name: 'w2', agent_type: 'general-purpose', prompt: '做 2', provider_id: 'p', model_id: 'mm' },
+      ],
+      tasks: [
+        { id: 't1', subject: 'T1', owner_id: 'm1', dependencies: [] },
+        { id: 't2', subject: 'T2', owner_id: 'm2', dependencies: [] },
+      ],
+    },
+  })
+
+  // 批准。
+  const approved = await callTool(mock.tools, 'team_plan', { operation: 'approve', team_name: team, request_id: 'req-1' })
+  assert.match(textOf(approved), /计划已批准/)
+
+  // 派发。
+  const before = memory.spawned?.length ?? 0
+  const launched = await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
+  const launchText = textOf(launched)
+  assert.match(launchText, /已派发/, launchText)
+
+  const { readTeamPlan } = await import('../dist/teamPlanStore.js')
+  const afterFirst = await readTeamPlan(team)
+  assert.equal(afterFirst.state, 'running', '派发完成后计划应进入 running')
+  assert.equal(afterFirst.launch.status, 'running')
+  assert.equal(Object.keys(afterFirst.launch.memberIds ?? {}).length, 2, '应记录两名成员的会话 ID')
+
+  // 再次 launch：没有待派发的计划，不应重复。
+  const again = await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
+  assert.match(textOf(again), /没有待派发的计划/)
+  const afterSecond = await readTeamPlan(team)
+  assert.deepEqual(afterSecond.launch.memberIds, afterFirst.launch.memberIds, '重复 launch 不应改变成员映射')
+  void before
+})
+
+test('未批准的计划不能 launch', async () => {
+  const team = 'not-approved'
+  await callTool(mock.tools, 'team_create', { team_name: team, spawn: false, members: [] })
+  await callTool(mock.tools, 'team_plan', {
+    operation: 'submit',
+    team_name: team,
+    plan: {
+      members: [{ id: 'm1', name: 'w', agent_type: 'general-purpose', prompt: 'x', provider_id: 'p', model_id: 'mm' }],
+      tasks: [{ id: 't1', subject: 'T', owner_id: 'm1', dependencies: [] }],
+    },
+  })
+  const launched = await callTool(mock.tools, 'team_plan', { operation: 'launch', team_name: team })
+  assert.match(textOf(launched), /没有待派发的计划/)
+})

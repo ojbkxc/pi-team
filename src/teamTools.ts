@@ -32,7 +32,11 @@ import {
   type TeamFile,
 } from './teamHelpers.js'
 import {
+  approveTeamPlan,
+  claimPlanLaunch,
+  completePlanLaunch,
   ensureTeamDraft,
+  failPlanLaunch,
   readTeamPlan,
   replaceTeamPlan,
   submitTeamPlan,
@@ -382,15 +386,25 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
     name: 'team_plan',
     label: '团队计划',
     description:
-      '管理团队计划：get 读取 / submit 提交完整提案等待用户审批 / update 更新字段。' +
+      '管理团队计划：get 读取 / submit 提交完整提案等待用户审批 / update 更新字段 / ' +
+      'approve 记录用户批准并进入待派发 / launch 派发已批准计划的成员。\n' +
       '计划包含成员（含运行时）与任务依赖图。\n\n' +
       '提交前必须满足：每个任务有且仅有一个 owner；每个成员至少被分到一个任务；任务依赖无环。\n' +
       '契约提醒：任务在实现阶段跳过 build/lint/test，构建与全量测试由 lead 在最后统一跑一次；' +
       '涉及共享文件的任务，其 owner 即该文件的唯一 integration owner。',
     parameters: Type.Object({
-      operation: Type.Union([Type.Literal('get'), Type.Literal('submit'), Type.Literal('update')], {
-        description: '计划操作：get 读取 / submit 提交审批 / update 更新',
+      operation: Type.Union([
+        Type.Literal('get'),
+        Type.Literal('submit'),
+        Type.Literal('update'),
+        Type.Literal('approve'),
+        Type.Literal('launch'),
+      ], {
+        description: '计划操作：get 读取 / submit 提交审批 / update 更新 / approve 批准 / launch 派发',
       }),
+      request_id: Type.Optional(Type.String({
+        description: 'approve 必需：本次批准的幂等键。同一个 request_id 重复批准不会二次提交。',
+      })),
       team_name: Type.Optional(Type.String({ description: '团队名；缺省用当前团队上下文' })),
       plan: Type.Optional(
         Type.Object({
@@ -414,7 +428,7 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
         }),
       ),
     }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       const denial = requireTeamLead(runtime)
       if (denial) return toolErrorResult(denial)
       try {
@@ -462,6 +476,95 @@ export function registerTeamTools(compat: CompatApi, runtime: TeamRuntime): void
             { members: toMembers(params.plan?.members || []), tasks: toTasks(params.plan?.tasks || []) },
           )
           return toolTextResult(`计划已提交审批（revision ${next.revision}，state ${next.state}）。请在团队面板中等待用户批准。`)
+        }
+
+        // --- approve：记录用户批准，state → launching、launch.status → pending ---
+        if (params.operation === 'approve') {
+          const guard = requireTeamLead(runtime)
+          if (guard) return toolErrorResult(guard)
+          const requestId = params.request_id?.trim()
+          if (!requestId) return toolErrorResult('approve 需要 request_id（幂等键）。')
+          const current = await readTeamPlan(teamName)
+          if (!current) return toolErrorResult(`团队 "${teamName}" 尚无计划；请先 submit。`)
+          const { plan: next, committed } = await approveTeamPlan(
+            teamName,
+            { planId: current.planId, sessionId: current.sessionId, incarnationId: current.incarnationId, expectedRevision: current.revision },
+            requestId,
+            current,
+          )
+          if (!committed) {
+            return toolTextResult(`该批准已记录过（request_id ${requestId}），未重复提交。当前 state ${next.state}，launch ${next.launch?.status ?? '无'}。`)
+          }
+          return toolTextResult(
+            `计划已批准（revision ${next.revision}，state ${next.state}，launch ${next.launch?.status}）。` +
+            `用 team_plan { operation: "launch" } 派发这 ${next.approvedSnapshot?.members.length ?? 0} 名成员。`,
+          )
+        }
+
+        // --- launch：认领待执行的计划并真正派发成员（Phase 4 步骤 5）---
+        if (params.operation === 'launch') {
+          const guard = requireTeamLead(runtime)
+          if (guard) return toolErrorResult(guard)
+          const claimed = await claimPlanLaunch(teamName)
+          if (!claimed) {
+            const existing = await readTeamPlan(teamName)
+            const state = existing?.state ?? '无计划'
+            const status = existing?.launch?.status ?? '无'
+            return toolTextResult(
+              `没有待派发的计划（state ${state}，launch ${status}）。` +
+              `可能已经派发过，或计划还没被 approve。`,
+            )
+          }
+
+          const { members } = claimed
+          const limitError = await checkSpawnLimits(teamName, members.length)
+          if (limitError) {
+            await failPlanLaunch(teamName, limitError)
+            return toolErrorResult(`${limitError}\n计划已标记 launch_failed。`)
+          }
+
+          const memberIds: Record<string, string> = {}
+          const lines: string[] = [`开始派发计划成员（共 ${members.length} 名）：`]
+          for (const member of members) {
+            try {
+              const handle = await host.start(
+                {
+                  name: member.name,
+                  profile: member.agentType || 'general-purpose',
+                  task: member.prompt,
+                  description: `${teamName}/${member.name}`,
+                  ...(member.runtime?.modelId ? { model: member.runtime.modelId } : {}),
+                  ...(member.runtime?.effortLevel ? { thinking: member.runtime.effortLevel } : {}),
+                  // 成员身份注入（设计文档 §8.4）：宿主据此让成员知道自己不是 lead。
+                  teamName,
+                  agentName: member.name,
+                  runInBackground: true,
+                },
+                ctx as CompatToolContext,
+              )
+              memberIds[member.name] = handle.sessionId
+              try {
+                await runtime.envFor(teamName).lifecycle.adopt(member.name, {
+                  sessionId: handle.sessionId,
+                  sessionFile: handle.sessionFile,
+                })
+              } catch {
+                // 登记失败不影响成员已经跑起来；下面照常报告派发成功。
+              }
+              lines.push(`  - ${member.name}: 已派发（会话 ${handle.sessionId}）`)
+            } catch (error) {
+              lines.push(`  - ${member.name}: 派发失败（${errorMessage(error)}）`)
+            }
+          }
+
+          const ok = Object.keys(memberIds).length
+          if (ok === 0) {
+            await failPlanLaunch(teamName, '所有成员都派发失败')
+            return toolErrorResult(`${lines.join('\n')}\n计划已标记 launch_failed。`)
+          }
+          const next = await completePlanLaunch(teamName, memberIds)
+          lines.push(`派发完成：${ok}/${members.length} 成功，计划 state ${next?.state ?? 'running'}。`)
+          return toolTextResult(lines.join('\n'))
         }
 
         const plan = await readTeamPlan(teamName)

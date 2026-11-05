@@ -351,4 +351,80 @@ export async function approveTeamPlan(teamName, identity, requestId, validated) 
         return { plan: next, committed: true };
     });
 }
+/**
+ * 领取一次待执行的 launch（Phase 4 步骤 5：审批后自动派发成员）。
+ *
+ * `approveTeamPlan()` 只把 state 置为 `launching` 且 `launch.status = 'pending'`，没有任何人
+ * 消费它 —— 计划批准后就永久停在那里。本函数是那个消费入口：原子地（持 plan 锁）把
+ * pending 认领成 running，并在返回值里给出要派发的成员快照。
+ *
+ * 幂等靠状态机而不是调用方自觉：第二次调用时 status 已不是 `pending`，返回 null，
+ * 于是重复批准/重复触发都不会重复 spawn。
+ */
+export async function claimPlanLaunch(teamName) {
+    return locked(teamName, async () => {
+        let plan;
+        try {
+            plan = teamPlanRecordSchema.parse(JSON.parse(await readFile(planPath(teamName), 'utf8')));
+        }
+        catch {
+            return null;
+        }
+        if (plan.state !== 'launching' || plan.launch?.status !== 'pending')
+            return null;
+        const members = plan.approvedSnapshot?.members ?? plan.members;
+        const next = {
+            ...plan,
+            revision: plan.revision + 1,
+            updatedAt: Date.now(),
+            launch: { ...plan.launch, status: 'running' },
+        };
+        await writePlan(next);
+        return { plan: next, members: structuredClone(members) };
+    });
+}
+/** 全部成员派发完成：`launching` → `running`，并记下成员名到会话 ID 的映射。 */
+export async function completePlanLaunch(teamName, memberIds) {
+    return locked(teamName, async () => {
+        let plan;
+        try {
+            plan = teamPlanRecordSchema.parse(JSON.parse(await readFile(planPath(teamName), 'utf8')));
+        }
+        catch {
+            return null;
+        }
+        if (plan.launch?.status !== 'running')
+            return null;
+        const next = {
+            ...plan,
+            state: 'running',
+            revision: plan.revision + 1,
+            updatedAt: Date.now(),
+            launch: { ...plan.launch, status: 'running', memberIds: { ...plan.launch.memberIds, ...memberIds } },
+        };
+        await writePlan(next);
+        return next;
+    });
+}
+/** 派发失败：记下错误供界面显示，避免计划无声地卡在 launching。 */
+export async function failPlanLaunch(teamName, error) {
+    return locked(teamName, async () => {
+        let plan;
+        try {
+            plan = teamPlanRecordSchema.parse(JSON.parse(await readFile(planPath(teamName), 'utf8')));
+        }
+        catch {
+            return null;
+        }
+        const next = {
+            ...plan,
+            state: 'launch_failed',
+            revision: plan.revision + 1,
+            updatedAt: Date.now(),
+            launch: { ...plan.launch, status: 'failed', error },
+        };
+        await writePlan(next);
+        return next;
+    });
+}
 //# sourceMappingURL=teamPlanStore.js.map
